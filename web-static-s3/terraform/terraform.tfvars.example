@@ -1,0 +1,11 @@
+
+aws_region          = "us-east-1"
+bucket_name_prefix  = "my-static-website-bucket"
+github_repo_url     = "https://github.com/your-username/your-repo.git"
+github_repo_path    = "dist"  # If your website files are in a subdirectory
+cloudfront_price_class = "PriceClass_100"
+tags = {
+  Environment = "Production"
+  Project     = "StaticWebsite"
+  Owner       = "DevOps"
+}
