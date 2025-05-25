@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'GitHub to S3 Sync for Static Website'
+
+Parameters:
+  InfrastructureStackName:
+    Type: String
+    Description: Name of the infrastructure stack
+    Default: 'static-website-infrastructure'
+
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner (username or organization)
+    Default: 'freilind'
+
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+    Default: 'hanoi'
+
+  GitHubBranch:
+    Type: String
+    Description: GitHub branch name
+    Default: 'main'
+
+  BucketName:
+    Type: String
+    Description: GitHub branch name
+    Default: ''
+
+  DistributionId:
+    Type: String
+    Description: GitHub branch name
+    Default: ''
+
+  SyncFrequency:
+    Type: String
+    Description: 'How often to sync from GitHub (CloudWatch rate expression)'
+    Default: 'rate(5 minutes)'
+    AllowedValues:
+      - 'rate(5 minutes)'
+      - 'rate(15 minutes)'
+      - 'rate(30 minutes)'
+      - 'rate(1 hour)'
+      - 'rate(6 hours)'
+      - 'rate(12 hours)'
+      - 'rate(1 day)'
+
+Resources:
+  # GitHub to S3 sync lambda
+  GitHubToS3SyncLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 128
+      Role: !GetAtt GitHubToS3SyncRole.Arn
+      Code:
+        ZipFile: |
+          import os
+          import urllib.request
+          import json
+          import zipfile
+          import tempfile
+          import io
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+            if event.get('RequestType') == 'Delete' and 'ResourceProperties' in event:
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+          
+            try:
+              # Check if it's a CloudWatch scheduled event
+              is_scheduled_event = 'detail-type' in event and event['detail-type'] == 'Scheduled Event'
+          
+              # Get parameters
+              if is_scheduled_event:
+                # For scheduled events, parameters are in environment variables
+                github_owner = os.environ.get('GITHUB_OWNER')
+                github_repo = os.environ.get('GITHUB_REPO')
+                github_branch = os.environ.get('GITHUB_BRANCH')
+                bucket_name = os.environ.get('BUCKET_NAME')
+                distribution_id = os.environ.get('DISTRIBUTION_ID')
+              else:
+                # For CloudFormation custom resource
+                props = event.get('ResourceProperties', {})
+                github_owner = props.get('GitHubOwner')
+                github_repo = props.get('GitHubRepo')
+                github_branch = props.get('GitHubBranch')
+                bucket_name = props.get('BucketName')
+                distribution_id = props.get('DistributionId')
+          
+              print(f"Syncing {github_owner}/{github_repo}:{github_branch} to S3 bucket {bucket_name}")
+          
+              # Download repository archive
+              download_url = f"https://github.com/{github_owner}/{github_repo}/archive/{github_branch}.zip"
+          
+              print(f"Downloading from {download_url}")
+              with urllib.request.urlopen(download_url) as response:
+                zip_content = response.read()
+          
+              # Extract archive
+              with tempfile.TemporaryDirectory() as temp_dir:
+                with zipfile.ZipFile(io.BytesIO(zip_content)) as zip_ref:
+                  zip_ref.extractall(temp_dir)
+          
+                # Find the extracted directory name
+                extracted_dir_name = f"{github_repo}-{github_branch}"
+                extracted_path = os.path.join(temp_dir, extracted_dir_name)
+          
+                # Sync to S3
+                s3 = boto3.client('s3')
+                s3_resource = boto3.resource('s3')
+                bucket = s3_resource.Bucket(bucket_name)
+          
+                # Optional: delete all existing files in bucket first
+                bucket.objects.all().delete()
+          
+                # Upload all files
+                file_count = 0
+                for root, dirs, files in os.walk(extracted_path):
+                  for file in files:
+                    local_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(local_path, extracted_path)
+          
+                    # Skip .git and .gitignore
+                    if '.git' in relative_path or relative_path == '.gitignore':
+                      continue
+          
+                    content_type = get_content_type(relative_path)
+                    s3.upload_file(
+                      local_path, 
+                      bucket_name, 
+                      relative_path,
+                      ExtraArgs={'ContentType': content_type}
+                    )
+                    file_count += 1
+          
+                print(f"Uploaded {file_count} files to S3 bucket {bucket_name}")
+          
+              # Invalidate CloudFront cache
+              if distribution_id:
+                cloudfront = boto3.client('cloudfront')
+                invalidation_id = cloudfront.create_invalidation(
+                  DistributionId=distribution_id,
+                  InvalidationBatch={
+                    'Paths': {
+                      'Quantity': 1,
+                      'Items': ['/*']
+                    },
+                    'CallerReference': str(context.aws_request_id)
+                  }
+                )['Invalidation']['Id']
+                print(f"Created CloudFront invalidation {invalidation_id} for distribution {distribution_id}")
+          
+              # Send response for CloudFormation custom resource
+              if not is_scheduled_event:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                {'Message': f'Synced {file_count} files from GitHub to S3'})
+            except Exception as e:
+              print(f"Error: {str(e)}")
+              # Only send response for CloudFormation custom resource
+              if 'ResponseURL' in event:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+              else:
+                # For scheduled events, just log the error
+                print(f"Failed to sync: {str(e)}")
+          
+          def get_content_type(filename):
+            extension = os.path.splitext(filename)[1].lower()
+            content_types = {
+              '.html': 'text/html',
+              '.css': 'text/css',
+              '.js': 'application/javascript',
+              '.json': 'application/json',
+              '.png': 'image/png',
+              '.jpg': 'image/jpeg',
+              '.jpeg': 'image/jpeg',
+              '.gif': 'image/gif',
+              '.svg': 'image/svg+xml',
+              '.ico': 'image/x-icon',
+              '.txt': 'text/plain',
+              '.pdf': 'application/pdf',
+              '.xml': 'application/xml',
+              '.woff': 'font/woff',
+              '.woff2': 'font/woff2',
+              '.ttf': 'font/ttf',
+              '.eot': 'application/vnd.ms-fontobject'
+            }
+            return content_types.get(extension, 'application/octet-stream')
+      Environment:
+        Variables:
+          GITHUB_OWNER: !Ref GitHubOwner
+          GITHUB_REPO: !Ref GitHubRepo
+          GITHUB_BRANCH: !Ref GitHubBranch
+          BUCKET_NAME: {'Fn::ImportValue': !Sub '${InfrastructureStackName}-BucketName'}
+          DISTRIBUTION_ID: {'Fn::ImportValue': !Sub '${InfrastructureStackName}-DistributionId'}
+
+  GitHubToS3SyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:DeleteObject'
+                Resource:
+                  - {'Fn::Sub': 'arn:aws:s3:::${BucketName}'}
+                  - {'Fn::Sub': 'arn:aws:s3:::${BucketName}/*'}
+                  - {'Fn::ImportValue': !Sub '${InfrastructureStackName}-BucketArn'}
+                  - {'Fn::Join': ['', [{'Fn::ImportValue': !Sub '${InfrastructureStackName}-BucketArn'}, '/*']]}
+        - PolicyName: CloudFrontInvalidation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudfront:CreateInvalidation'
+                Resource: {'Fn::Sub': 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${DistributionId}'}
+
+  # Initial sync
+  GitHubToS3InitialSync:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt GitHubToS3SyncLambda.Arn
+      GitHubOwner: !Ref GitHubOwner
+      GitHubRepo: !Ref GitHubRepo
+      GitHubBranch: !Ref GitHubBranch
+      BucketName: {'Fn::ImportValue': !Sub '${InfrastructureStackName}-BucketName'}
+      DistributionId: {'Fn::ImportValue': !Sub '${InfrastructureStackName}-DistributionId'}
+
+  # Add lambda function for periodic sync
+  PeriodicSyncRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Periodically sync GitHub repository to S3 bucket"
+      ScheduleExpression: !Ref SyncFrequency
+      State: "ENABLED"
+      Targets:
+        - Id: "SyncLambdaTarget"
+          Arn: !GetAtt GitHubToS3SyncLambda.Arn
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GitHubToS3SyncLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt PeriodicSyncRule.Arn
+
+Outputs:
+  SyncLambdaArn:
+    Description: 'ARN of the GitHub to S3 sync Lambda function'
+    Value: !GetAtt GitHubToS3SyncLambda.Arn
+
+  SyncSchedule:
+    Description: 'Schedule for automatic GitHub to S3 sync'
+    Value: !Ref SyncFrequency

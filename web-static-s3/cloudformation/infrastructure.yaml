@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Static Website Hosting Infrastructure - S3 and CloudFront'
+
+Parameters:
+  BucketNamePrefix:
+    Type: String
+    Default: 'my-static-website'
+    Description: Prefix for the S3 bucket name
+
+  PriceClass:
+    Type: String
+    Default: 'PriceClass_100'
+    AllowedValues:
+      - 'PriceClass_100'
+      - 'PriceClass_200'
+      - 'PriceClass_All'
+    Description: CloudFront distribution price class
+
+Resources:
+  # Random suffix for bucket name uniqueness
+  RandomSuffix:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt GenerateRandomSuffixFunction.Arn
+      Length: 8
+
+  GenerateRandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import random
+          import string
+          def handler(event, context):
+            if event['RequestType'] == 'Delete':
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+          
+            length = event['ResourceProperties'].get('Length', 8)
+            result = ''.join(random.choices(string.ascii_lowercase + string.digits, k=int(length)))
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Value': result})
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  # S3 bucket for website hosting
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketNamePrefix}-${RandomSuffix.Value}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketNamePrefix}-website-bucket'
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebsiteDistribution}'
+
+  # CloudFront configuration
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${BucketNamePrefix}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebsiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: !Ref PriceClass
+        DefaultCacheBehavior:
+          TargetOriginId: s3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized policy
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # CORS-S3Origin policy
+        Origins:
+          - Id: s3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketNamePrefix}-distribution'
+
+Outputs:
+  BucketName:
+    Description: 'Name of the S3 bucket'
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the S3 bucket'
+    Value: !GetAtt WebsiteBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  CloudFrontDistributionId:
+    Description: 'ID of the CloudFront distribution'
+    Value: !Ref WebsiteDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionId'
+
+  CloudFrontDomainName:
+    Description: 'Domain name of the CloudFront distribution'
+    Value: !GetAtt WebsiteDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainName'
+
+  WebsiteUrl:
+    Description: 'URL of the website'
+    Value: !Sub 'https://${WebsiteDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteUrl'

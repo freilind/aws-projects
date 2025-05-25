@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Custom Domain for Static Website'
+
+Parameters:
+  InfrastructureStackName:
+    Type: String
+    Description: Name of the infrastructure stack
+    Default: 'static-website-infrastructure'
+
+  DomainName:
+    Type: String
+    Description: 'Custom domain name (e.g., example.com)'
+
+  HostedZoneId:
+    Type: String
+    Description: 'Route 53 Hosted Zone ID for the domain'
+
+Resources:
+  # SSL Certificate
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  # CloudFront distribution with custom domain
+  CloudFrontDistributionUpdate:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt UpdateDistributionFunction.Arn
+      DistributionId: {'Fn::ImportValue': !Sub '${InfrastructureStackName}-DistributionId'}
+      DomainName: !Ref DomainName
+      CertificateArn: !Ref Certificate
+
+  # Lambda to update CloudFront distribution
+  UpdateDistributionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt UpdateDistributionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+          
+              try:
+                  distribution_id = event['ResourceProperties']['DistributionId']
+                  domain_name = event['ResourceProperties']['DomainName']
+                  certificate_arn = event['ResourceProperties']['CertificateArn']
+          
+                  # Get current distribution config
+                  cloudfront = boto3.client('cloudfront')
+                  response = cloudfront.get_distribution_config(Id=distribution_id)
+          
+                  config = response['DistributionConfig']
+                  etag = response['ETag']
+          
+                  # Update the config with custom domain and certificate
+                  config['Aliases'] = {
+                      'Quantity': 1,
+                      'Items': [domain_name]
+                  }
+                  config['ViewerCertificate'] = {
+                      'ACMCertificateArn': certificate_arn,
+                      'SSLSupportMethod': 'sni-only',
+                      'MinimumProtocolVersion': 'TLSv1.2_2021'
+                  }
+          
+                  # Update the distribution
+                  cloudfront.update_distribution(
+                      Id=distribution_id,
+                      IfMatch=etag,
+                      DistributionConfig=config
+                  )
+          
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': f'Added {domain_name} to CloudFront distribution {distribution_id}'
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  UpdateDistributionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CloudFrontAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudfront:GetDistributionConfig'
+                  - 'cloudfront:UpdateDistribution'
+                Resource: {'Fn::Sub': 'arn:aws:cloudfront::${AWS::AccountId}:distribution/*'}
+
+  # DNS record for the custom domain
+  DomainRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: {'Fn::ImportValue': !Sub '${InfrastructureStackName}-DomainName'}
+        HostedZoneId: Z2FDTNDATAQYW2  # CloudFront hosted zone ID (always the same)
+        EvaluateTargetHealth: false
+
+Outputs:
+  CustomDomain:
+    Description: 'Custom domain for the website'
+    Value: !Ref DomainName
+
+  CertificateArn:
+    Description: 'ARN of the SSL certificate'
+    Value: !Ref Certificate
