@@ -9,6 +9,8 @@ This project sets up static website hosting on AWS using S3 and CloudFront, with
 - Random bucket name generation for uniqueness
 - GitHub integration for automated deployments
 - Organized Terraform code structure
+  
+![iac](iac-s3-web.png)
 
 ## Project Structure
 
